@@ -1,3 +1,5 @@
+from email.mime import base
+import os
 from pathlib import Path
 from typing import Dict, List, Literal, MutableMapping, Tuple
 from msgspec import DecodeError
@@ -7,6 +9,17 @@ from msgspec.msgpack import Decoder, Encoder
 
 def lenb(bytes: bytes):
     return len(bytes).to_bytes(4, "big", signed=False)
+
+
+base_flags = os.O_CREAT | os.O_RDWR | os.O_BINARY
+
+
+def index_optimised(path, flags):
+    return os.open(path, flags | base_flags | os.O_SEQUENTIAL)
+
+
+def data_optimised(path, flags):
+    return os.open(path, flags | base_flags | os.O_RANDOM)
 
 
 class ChestException(Exception):
@@ -34,17 +47,17 @@ class ChestDatabase(MutableMapping):
 
         # The index is an in-memory dict, mirroring the index file.
         # It maps indexes to their position in the datafile
-        self._index: Dict[str | bytes, int] = dict()
+        self._index: Dict[str | bytes | int, int] = dict()
 
         # free_blocks keep track of the free blocks in the file.
         # These free bocks might be reused later on.
-        self._free_blocks: List[int] = []
+        self._free_blocks: List[int, int] = []
 
         # If there has been any change to the index in memory and the index has not been committed, this will be True.
         self._modified: bool = False
 
         # initializing an encoder and decoder wich will be used for the index.
-        self._decoder = Decoder(Dict[str | bytes, int])
+        self._decoder = Decoder(Dict[str | bytes | int, int])
         self._encoder = Encoder()
 
         # checks that everything exists
@@ -68,16 +81,19 @@ class ChestDatabase(MutableMapping):
                 )
 
         if self._mode == "r+":
-            self._indexfile.touch()
-            self._datafile.touch()
-            self.fh_index = self._indexfile.open("rb+", buffering=0)
-            self.fh_data = self._datafile.open("rb+", buffering=0)
+            self.fh_index = open(
+                self._indexfile, "rb+", buffering=0, opener=index_optimised
+            )
+            self.fh_data = open(
+                self._datafile, "rb+", buffering=0, opener=data_optimised
+            )
         else:
             self.fh_index = self._indexfile.open("rb", buffering=0)
             self.fh_data = self._datafile.open("rb", buffering=0)
 
     def _load(self):
         # ?: needs a way to populate free_blocks
+        self._populate_free_blocks()
 
         try:
             self.fh_index.seek(0)
@@ -94,14 +110,17 @@ class ChestDatabase(MutableMapping):
         except OSError:
             raise IndexException
 
+    def _populate_free_blocks(self):
+        pass
+
     def _commit(self):
         # ? should commit be copy on write?
 
         if not self._modified:
             return
-
         self.fh_index.seek(0)
         self.fh_index.write(self._encoder.encode(self._index))
+        self.fh_index.truncate()
 
     def _is__open(self):
         # todo implement this somewhere
@@ -116,7 +135,7 @@ class ChestDatabase(MutableMapping):
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        self._commit()
+        # self._commit()
 
     def _setval(self, key, val, pos):
         self._modified = True
@@ -153,6 +172,7 @@ class ChestDatabase(MutableMapping):
                 self.fh_data.seek(pos)
                 size = int.from_bytes(self.fh_data.read(4), "big", signed=False)
 
+                # * if smaller -> add free space to free_blocks
                 if new_length <= size:
                     self._setval(key, val, pos)
                     return
@@ -178,13 +198,6 @@ class ChestDatabase(MutableMapping):
         except Exception as e:
             raise e
 
-    def close(self, exc_type, exc_value, exc_traceback):
-        self._commit()
-        self.fh_index.flush()
-        self.fh_data.flush()
-        self.fh_data.close()
-        self.fh_index.close()
-
     def __getitem__(self, key):
         # todo handle the errors
 
@@ -193,8 +206,20 @@ class ChestDatabase(MutableMapping):
         self.fh_data.seek(pos)
         dat = memoryview(self.fh_data.read(512))
         siz = dat[0:4]
-        dat = dat[4 : int.from_bytes(siz, "big", signed=False) + 4]
+        dat = dat[4 : int.from_bytes(siz, "big", signed=True) + 4]
         return dat
+
+    def __delitem__(self, key) -> None:
+        self._modified = True
+
+        pos = self._index[key]
+        self.fh_data.seek(pos)
+
+        siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
+        pos = self._index.pop(key)
+        self._setfree(pos, siz)
+
+        self._commit()
 
     def __enter__(self):
         return self
@@ -202,51 +227,22 @@ class ChestDatabase(MutableMapping):
     def __iter__(self):
         return iter(self._index) if self._index != None else iter([])
 
-    def __delitem__(self, key) -> None:
-        if not self._mode == "r+":
-            raise PermissionError("Storage is _openend as read only")
-
-        # ? forgiveness > permisson
-        if isinstance(key, str):
-            key = key.encode("utf-8")
-
-        self._modified = True
-
-        self._setfree(self._index.pop(key))
-
+    def close(self, exc_type, exc_value, exc_traceback):
         self._commit()
+        self.fh_index.flush()
+        self.fh_data.flush()
+        self.fh_data.close()
+        self.fh_index.close()
 
     __exit__ = close
 
-    def __len__(self) -> int:
-        # * really isn't usefull yet
-        if self._index == None or len(self._index) == 0:
-            return 0
-        try:
-            self.fh_index.seek(0)
-            with memoryview(self.fh_index.read(5)) as view:
-                match view[0]:
-                    case x if (x & 0b11110000) == self.FIXMAP:
-                        return x & 0b00001111
-                    case self.MAP_16:
-                        return int.from_bytes(view[1:3], "big")
-                    case self.MAP_32:
-                        return int.from_bytes(view[1:5], "big")
-                    case _:
-                        return 0
-        except IndexError:
-            return 0
-
-        assert False
-
-    def _setfree(self, start):
-        # todo test this better, sorting, performance, ...
-        for s, l in self._free_blocks:
-            if (s + l + 1) == start:
-                self._free_blocks.append((s, l + length))
-                return
+    def _setfree(self, start, length):
+        # todo: coaless, sort, ...
         self._free_blocks.append((start, length))
-        self._free_blocks = sorted(self._free_blocks, key=lambda t: t[1])
+        self._free_blocks = sorted(self._free_blocks)
+
+    def __len__(self):
+        raise NotImplemented
 
 
 # todo create transaction logic
