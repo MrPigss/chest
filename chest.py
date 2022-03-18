@@ -1,9 +1,9 @@
-from email.mime import base
+from hmac import new
 import os
 from pathlib import Path
 from typing import Dict, List, Literal, MutableMapping, Tuple
-from msgspec import DecodeError
 
+from msgspec import DecodeError
 from msgspec.msgpack import Decoder, Encoder
 
 
@@ -34,6 +34,7 @@ class ChestDatabase(MutableMapping):
     FIXMAP = 0x80
     MAP_16 = 0xDE
     MAP_32 = 0xDF
+    MIN_BLOCK_SIZE = 0x20
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
 
@@ -51,7 +52,8 @@ class ChestDatabase(MutableMapping):
 
         # free_blocks keep track of the free blocks in the file.
         # These free bocks might be reused later on.
-        self._free_blocks: List[int, int] = []
+        self._free_blocks: List[Tuple[int, int]] = []
+        self._fragments: List[Tuple[int, int]] = []
 
         # If there has been any change to the index in memory and the index has not been committed, this will be True.
         self._modified: bool = False
@@ -188,10 +190,8 @@ class ChestDatabase(MutableMapping):
 
                 elif new_length < block_size:
                     self._setval(key, val, block_pos)
-                    self._free_blocks[i] = (
-                        block_pos + new_length,
-                        block_size - new_length,
-                    )
+                    del self._free_blocks[i]
+                    self._setfree(block_pos + new_length, block_size - new_length)
                     return
 
             self._addval(key, val)
@@ -217,6 +217,7 @@ class ChestDatabase(MutableMapping):
 
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         pos = self._index.pop(key)
+
         self._setfree(pos, siz)
 
         self._commit()
@@ -236,22 +237,30 @@ class ChestDatabase(MutableMapping):
 
     __exit__ = close
 
-    def _setfree(self, start, length):
-        # todo: coaless, sort, ...
-        self._free_blocks.append((start, length))
+    def _setfree(self, pos, siz):
+        # todo: sort, ...
+
+        # check free blocks for a chance of coalescing
+        for i, free in enumerate(self._free_blocks):
+            # check for free blocks before new free block
+            if 4 + sum(free) == pos:
+                pos = free[0]
+                siz = siz + free[1] + 4
+                del self._free_blocks[i]
+                break
+
+            # check for free blocks after new free block
+            elif (pos + siz + 4) == free[0]:
+                siz = siz + free[1] + 4
+                del self._free_blocks[i]
+                break
+
+        if siz < self.MIN_BLOCK_SIZE:
+            self._fragments.append((pos, siz))
+            return
+
+        self._free_blocks.append((pos, siz))
         self._free_blocks = sorted(self._free_blocks)
 
     def __len__(self):
         raise NotImplemented
-
-
-# todo create transaction logic
-class Transaction:
-    def __init__(self, database: ChestDatabase):
-        self._db = database
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        self._db._commit()
