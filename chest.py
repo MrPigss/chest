@@ -233,6 +233,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         self._setfree(pos, siz)
 
+        # self._commit()
     def __enter__(self):
         return self
 
@@ -266,12 +267,12 @@ class ChestDatabase(MutableMapping):
                 del self._free_space[i]
                 break
 
-        # block is too small, no use to keep checking, add to fragments list, can be used later
+        
         self.fh_data.seek(pos)
         self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
         self.fh_data.write(b"\0" * siz)
-        if siz < 220:
-            return
+        # if siz < 220: # block is too small, no use to keep checking, add to fragments list, can be used later
+        #     return
         self._free_space.append((pos, siz))
 
     def __len__(self):
