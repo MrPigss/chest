@@ -1,4 +1,3 @@
-from hmac import new
 import os
 from pathlib import Path
 from typing import Dict, List, Literal, MutableMapping, Tuple
@@ -31,10 +30,7 @@ class IndexException(ChestException):
 
 
 class ChestDatabase(MutableMapping):
-    FIXMAP = 0x80
-    MAP_16 = 0xDE
-    MAP_32 = 0xDF
-    MIN_BLOCK_SIZE = 0x20
+    MIN_BLOCK_SIZE = 0x04
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
 
@@ -52,7 +48,7 @@ class ChestDatabase(MutableMapping):
 
         # free_blocks keep track of the free blocks in the file.
         # These free bocks might be reused later on.
-        self._free_blocks: List[Tuple[int, int]] = []
+        self._free_space: List[Tuple[int, int]] = []
         self._fragments: List[Tuple[int, int]] = []
 
         # If there has been any change to the index in memory and the index has not been committed, this will be True.
@@ -113,7 +109,20 @@ class ChestDatabase(MutableMapping):
             raise IndexException
 
     def _populate_free_blocks(self):
-        pass
+        self.fh_data.seek(0)
+        while len((block := self.fh_data.read(4))) == 4:
+            size = int.from_bytes(block, "big", signed=True)
+            if size < 0:
+                size = ~size
+                pos = self.fh_data.tell()
+                self._setfree(pos - 4, size)
+            try:
+                self.fh_data.seek(size, 1)
+            except OSError:
+                print("oops")
+
+        print(self._free_space)
+        # pass
 
     def _commit(self):
         # ? should commit be copy on write?
@@ -123,10 +132,6 @@ class ChestDatabase(MutableMapping):
         self.fh_index.seek(0)
         self.fh_index.write(self._encoder.encode(self._index))
         self.fh_index.truncate()
-
-    def _is__open(self):
-        # todo implement this somewhere
-        return self._index is None
 
     def _addval(self, key: bytes, val: bytes):
         self._modified = True
@@ -148,55 +153,65 @@ class ChestDatabase(MutableMapping):
         self._index[key] = pos
         # self._commit()
 
-    def __setitem__(self, key, val):
-        # todo fix better persistance algorithm
-        # ? instead of all the isinstance check, use try catch -> better to ask forgiveness than permission
-        # if not self._mode == "r+":
-        #     raise PermissionError("Storage is _openend as read only")
+    def __setitem__(self, key, value):
+        # todo handle input checks
+        new_size = len(value)
+        if key in self._index:
+            old_pos = self._index[key]  # pos from index
+            self.fh_data.seek(old_pos)  # go to pos
+            old_size = int.from_bytes(
+                self.fh_data.read(4), "big", signed=False
+            )  # read size from data file
 
-        # if isinstance(key, str):
-        #     key = key.encode("utf-8")
+            if new_size > old_size:  # bigger
 
-        # if not isinstance(key, (bytes, bytearray)):
-        #     raise TypeError("keys must be bytes or strings")
+                # new data doesn't fit, free the used storage
+                self._setfree(old_pos, old_size)
 
-        # if isinstance(val, str):
-        #     val = val.encode("utf-8")
+                # check for room elsewhere or add to the end of file
+                if new_pos := self._claim_free_space(new_size):
+                    self._setval(key, value, new_pos)
 
-        # if not isinstance(val, (bytes, bytearray)):
-        #     raise TypeError("values must be bytes or strings")
+                else:
+                    self._addval(key, value)
 
-        new_length = len(val)
-        try:
-            if key in self._index:
+            elif new_size < old_size:  # smaller
+                if (
+                    free := (old_size - new_size)
+                ) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
+                    self._setval(key, value, old_pos)
+                    new_free_pos = old_pos + new_size + 4
+                    new_free_size = free - 4
+                    self._setfree(new_free_pos, new_free_size)
 
-                pos = self._index[key]
-                self.fh_data.seek(pos)
-                size = int.from_bytes(self.fh_data.read(4), "big", signed=False)
+                else:
+                    value += b"\0" * free
+                    self._setval(key, value, old_pos)
+            else:  # same size
+                self._setval(key, value, old_pos)
+        else:
+            if (new_pos := self._claim_free_space(new_size)) != None:
+                self._setval(key, value, new_pos)
+            else:
+                self._addval(key, value)
 
-                # * if smaller -> add free space to free_blocks
-                if new_length <= size:
-                    self._setval(key, val, pos)
-                    return
+    def _claim_free_space(self, size) -> int:
+        for i, block in enumerate(self._free_space):
+            free_pos = block[0]
+            free_size = block[1]
 
-            for i, block in enumerate(self._free_blocks):
-                block_pos = block[0]
-                block_size = block[1]
+            if size == free_size:
+                del self._free_space[i]
+                return free_pos
 
-                if new_length == block_size:
-                    self._setval(key, val, block_pos)
-                    del self._free_blocks[i]
-                    return
+            if size < free_size:
+                del self._free_space[i]
+                new_free_pos = free_pos + size + 4
+                new_free_size = free_size - size - 4
+                self._setfree(new_free_pos, new_free_size)
+                return free_pos
 
-                elif new_length < block_size:
-                    self._setval(key, val, block_pos)
-                    del self._free_blocks[i]
-                    self._setfree(block_pos + new_length, block_size - new_length)
-                    return
-
-            self._addval(key, val)
-        except Exception as e:
-            raise e
+        return None
 
     def __getitem__(self, key):
         # todo handle the errors
@@ -212,15 +227,11 @@ class ChestDatabase(MutableMapping):
     def __delitem__(self, key) -> None:
         self._modified = True
 
-        pos = self._index[key]
+        pos = self._index.pop(key)
         self.fh_data.seek(pos)
 
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
-        pos = self._index.pop(key)
-
         self._setfree(pos, siz)
-
-        self._commit()
 
     def __enter__(self):
         return self
@@ -241,26 +252,27 @@ class ChestDatabase(MutableMapping):
         # todo: sort, ...
 
         # check free blocks for a chance of coalescing
-        for i, free in enumerate(self._free_blocks):
+        for i, free in enumerate(self._free_space):
             # check for free blocks before new free block
             if 4 + sum(free) == pos:
                 pos = free[0]
                 siz = siz + free[1] + 4
-                del self._free_blocks[i]
+                del self._free_space[i]
                 break
 
             # check for free blocks after new free block
             elif (pos + siz + 4) == free[0]:
                 siz = siz + free[1] + 4
-                del self._free_blocks[i]
+                del self._free_space[i]
                 break
 
-        if siz < self.MIN_BLOCK_SIZE:
-            self._fragments.append((pos, siz))
+        # block is too small, no use to keep checking, add to fragments list, can be used later
+        self.fh_data.seek(pos)
+        self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
+        self.fh_data.write(b"\0" * siz)
+        if siz < 220:
             return
-
-        self._free_blocks.append((pos, siz))
-        self._free_blocks = sorted(self._free_blocks)
+        self._free_space.append((pos, siz))
 
     def __len__(self):
         raise NotImplemented
