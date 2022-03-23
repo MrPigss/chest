@@ -1,9 +1,10 @@
 import _thread as Thread
 import os
 from pathlib import Path
-from threading import Event, Lock
+from threading import Event
+# from threading import enumerate as threads
 from typing import Dict, List, Literal, MutableMapping, Tuple
-
+from time import sleep
 from msgspec import DecodeError
 from msgspec.msgpack import Decoder, Encoder
 
@@ -36,9 +37,10 @@ class ChestDatabase(MutableMapping):
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
         #threading stuff
-        self._shutdown_lock = Lock()
+        self._shutdown_lock = Thread.allocate_lock()
 
         self._modified: Event = Event()
+        self._data_modified: Event = Event()
 
         self._is_running = True
         # _indexfile contains the indexes with their respective locations in the _datafile,
@@ -155,15 +157,15 @@ class ChestDatabase(MutableMapping):
 
             if new_size > old_size:  # bigger
 
-                # new data doesn't fit, free the used storage
-                self._setfree(old_pos, old_size)
-
                 # check for room elsewhere or add to the end of file
                 if new_pos := self._claim_free_space(new_size):
                     self._setval(key, value, new_pos)
 
                 else:
                     self._addval(key, value)
+
+                # new data doesn't fit, free the used storage
+                self._setfree(old_pos, old_size)
 
             elif new_size < old_size:  # smaller
                 if (free := (old_size - new_size)) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
@@ -232,6 +234,7 @@ class ChestDatabase(MutableMapping):
     def close(self, exc_type, exc_value, exc_traceback):
         self._commit()
         self._is_running = False
+        while Thread._count() != 1: sleep(0)
         self._shutdown_lock.acquire()
         self.fh_index.flush()
         self.fh_data.flush()
@@ -269,10 +272,10 @@ class ChestDatabase(MutableMapping):
         raise NotImplemented
 
     def _threaded_index_writer(self):
-        with self._shutdown_lock:
-            while self._is_running:
-                self._modified.wait()
-                self.fh_index.seek(0)
-                self.fh_index.write(self._encoder.encode(self._index))
-                self.fh_index.truncate()
-                self._modified.clear()
+        # with self._shutdown_lock:
+        while self._is_running:
+            self._modified.wait()
+            self.fh_index.seek(0)
+            self.fh_index.write(self._encoder.encode(self._index))
+            self.fh_index.truncate()
+            self._modified.clear()
