@@ -1,7 +1,7 @@
 import _thread as Thread
 import os
 from pathlib import Path
-from threading import Condition, Lock
+from threading import Event, Lock
 from typing import Dict, List, Literal, MutableMapping, Tuple
 
 from msgspec import DecodeError
@@ -38,7 +38,7 @@ class ChestDatabase(MutableMapping):
         #threading stuff
         self._shutdown_lock = Lock()
 
-        self._modified: Condition = Condition()
+        self._modified: Event = Event()
 
         self._is_running = True
         # _indexfile contains the indexes with their respective locations in the _datafile,
@@ -127,8 +127,7 @@ class ChestDatabase(MutableMapping):
         # pass
 
     def _commit(self):
-        with self._modified:
-            self._modified.notify()
+        self._modified.set()
 
     def _addval(self, key: bytes, val: bytes):
         self.fh_data.seek(0, 2)
@@ -137,14 +136,14 @@ class ChestDatabase(MutableMapping):
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        self._commit()
+        # self._commit()
 
     def _setval(self, key, val, pos):
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        self._commit()
+        # self._commit()
 
     def __setitem__(self, key, value):
         # todo handle input checks
@@ -222,7 +221,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         self._setfree(pos, siz)
 
-        self._commit()
+        # self._commit()
 
     def __enter__(self):
         return self
@@ -272,8 +271,8 @@ class ChestDatabase(MutableMapping):
     def _threaded_index_writer(self):
         with self._shutdown_lock:
             while self._is_running:
-                with self._modified:
-                    self._modified.wait()
-                    self.fh_index.seek(0)
-                    self.fh_index.write(self._encoder.encode(self._index))
-                    self.fh_index.truncate()
+                self._modified.wait()
+                self.fh_index.seek(0)
+                self.fh_index.write(self._encoder.encode(self._index))
+                self.fh_index.truncate()
+                self._modified.clear()
