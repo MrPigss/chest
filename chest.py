@@ -1,5 +1,7 @@
+import _thread as Thread
 import os
 from pathlib import Path
+from threading import Condition, Lock
 from typing import Dict, List, Literal, MutableMapping, Tuple
 
 from msgspec import DecodeError
@@ -33,7 +35,12 @@ class ChestDatabase(MutableMapping):
     MIN_BLOCK_SIZE = 0x04
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
+        #threading stuff
+        self._shutdown_lock = Lock()
 
+        self._modified: Condition = Condition()
+
+        self._is_running = True
         # _indexfile contains the indexes with their respective locations in the _datafile,
         # _datafile contains all the data in binary format pointed to by _indexfile.
         self._indexfile: Path = path
@@ -51,9 +58,6 @@ class ChestDatabase(MutableMapping):
         self._free_space: List[Tuple[int, int]] = []
         self._fragments: List[Tuple[int, int]] = []
 
-        # If there has been any change to the index in memory and the index has not been committed, this will be True.
-        self._modified: bool = False
-
         # initializing an encoder and decoder wich will be used for the index.
         self._decoder = Decoder(Dict[str | bytes | int, int])
         self._encoder = Encoder()
@@ -61,6 +65,8 @@ class ChestDatabase(MutableMapping):
         # checks that everything exists
         self._check()
         self._load()
+
+        Thread.start_new_thread(self._threaded_index_writer, ())
 
     def _check(self):
         if not self._mode in {"r", "r+"}:
@@ -79,12 +85,8 @@ class ChestDatabase(MutableMapping):
                 )
 
         if self._mode == "r+":
-            self.fh_index = open(
-                self._indexfile, "rb+", buffering=0, opener=index_optimised
-            )
-            self.fh_data = open(
-                self._datafile, "rb+", buffering=0, opener=data_optimised
-            )
+            self.fh_index = open(self._indexfile, "rb+", buffering=0, opener=index_optimised)
+            self.fh_data = open(self._datafile, "rb+", buffering=0, opener=data_optimised)
         else:
             self.fh_index = self._indexfile.open("rb", buffering=0)
             self.fh_data = self._datafile.open("rb", buffering=0)
@@ -125,33 +127,24 @@ class ChestDatabase(MutableMapping):
         # pass
 
     def _commit(self):
-        # ? should commit be copy on write?
-
-        if not self._modified:
-            return
-        self.fh_index.seek(0)
-        self.fh_index.write(self._encoder.encode(self._index))
-        self.fh_index.truncate()
+        with self._modified:
+            self._modified.notify()
 
     def _addval(self, key: bytes, val: bytes):
-        self._modified = True
-
         self.fh_data.seek(0, 2)
 
         pos = int(self.fh_data.tell())
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        # self._commit()
+        self._commit()
 
     def _setval(self, key, val, pos):
-        self._modified = True
-
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        # self._commit()
+        self._commit()
 
     def __setitem__(self, key, value):
         # todo handle input checks
@@ -159,9 +152,7 @@ class ChestDatabase(MutableMapping):
         if key in self._index:
             old_pos = self._index[key]  # pos from index
             self.fh_data.seek(old_pos)  # go to pos
-            old_size = int.from_bytes(
-                self.fh_data.read(4), "big", signed=False
-            )  # read size from data file
+            old_size = int.from_bytes(self.fh_data.read(4), "big", signed=False)  # read size from data file
 
             if new_size > old_size:  # bigger
 
@@ -176,9 +167,7 @@ class ChestDatabase(MutableMapping):
                     self._addval(key, value)
 
             elif new_size < old_size:  # smaller
-                if (
-                    free := (old_size - new_size)
-                ) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
+                if (free := (old_size - new_size)) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
                     self._setval(key, value, old_pos)
                     new_free_pos = old_pos + new_size + 4
                     new_free_size = free - 4
@@ -233,7 +222,8 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         self._setfree(pos, siz)
 
-        # self._commit()
+        self._commit()
+
     def __enter__(self):
         return self
 
@@ -242,6 +232,8 @@ class ChestDatabase(MutableMapping):
 
     def close(self, exc_type, exc_value, exc_traceback):
         self._commit()
+        self._is_running = False
+        self._shutdown_lock.acquire()
         self.fh_index.flush()
         self.fh_data.flush()
         self.fh_data.close()
@@ -267,7 +259,6 @@ class ChestDatabase(MutableMapping):
                 del self._free_space[i]
                 break
 
-        
         self.fh_data.seek(pos)
         self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
         self.fh_data.write(b"\0" * siz)
@@ -277,3 +268,12 @@ class ChestDatabase(MutableMapping):
 
     def __len__(self):
         raise NotImplemented
+
+    def _threaded_index_writer(self):
+        with self._shutdown_lock:
+            while self._is_running:
+                with self._modified:
+                    self._modified.wait()
+                    self.fh_index.seek(0)
+                    self.fh_index.write(self._encoder.encode(self._index))
+                    self.fh_index.truncate()
