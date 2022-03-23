@@ -142,7 +142,7 @@ class ChestDatabase(MutableMapping):
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        # self._commit()
+        self._commit()
 
     def _setval(self, key, val, pos):
         self._modified = True
@@ -151,7 +151,7 @@ class ChestDatabase(MutableMapping):
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        # self._commit()
+        self._commit()
 
     def __setitem__(self, key, value):
         # todo handle input checks
@@ -233,7 +233,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         self._setfree(pos, siz)
 
-        # self._commit()
+        self._commit()
     def __enter__(self):
         return self
 
