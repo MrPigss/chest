@@ -39,8 +39,8 @@ class ChestDatabase(MutableMapping):
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
         # threading stuff
-        self._lock_one = TurnLock()
-        self._lock_one.acquire()
+        self._turn_lock = TurnLock()
+        self._turn_lock.acquire()
 
         self._modified: Event = Event()
         # self._data_modified: Event = Event()
@@ -139,11 +139,11 @@ class ChestDatabase(MutableMapping):
         self._modified.set()
 
     def _addval(self, key: bytes, value: bytes):
-        with self._lock_one:
+        with self._turn_lock:
             self.transaction = partial(self._addval_threaded, key, value)
 
     def _setval(self, key: bytes, value: bytes, pos: int):
-        with self._lock_one:
+        with self._turn_lock:
             self.transaction = partial(self._setval_threaded, key, value, pos)
 
     def _addval_threaded(self, key: bytes, val: bytes):
@@ -282,7 +282,7 @@ class ChestDatabase(MutableMapping):
 
         self.fh_data.seek(pos)
         self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
-        self.fh_data.write(b"\0" * siz)
+        # self.fh_data.write(b"\0" * siz)
         if siz < 220: # block is too small, no use to keep checking, add to fragments list, can be used later
             return
         self._free_space.append((pos, siz))
@@ -300,5 +300,5 @@ class ChestDatabase(MutableMapping):
 
     def _threaded_data_writer(self):
         while self._is_running:
-            with self._lock_one:
+            with self._turn_lock:
                 self.transaction()
