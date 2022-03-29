@@ -1,4 +1,5 @@
 import _thread as Thread
+from _thread import _count
 import os
 from functools import partial
 from pathlib import Path
@@ -129,10 +130,7 @@ class ChestDatabase(MutableMapping):
                 size = ~size
                 pos = self.fh_data.tell()
                 self._setfree(pos - 4, size)
-            try:
                 self.fh_data.seek(size, 1)
-            except OSError:
-                print("oops")
 
         print(self._free_space)
         # pass
@@ -144,6 +142,10 @@ class ChestDatabase(MutableMapping):
         with self._lock_one:
             self.transaction = partial(self._addval_threaded, key, value)
 
+    def _setval(self, key: bytes, value: bytes, pos: int):
+        with self._lock_one:
+            self.transaction = partial(self._setval_threaded, key, value, pos)
+
     def _addval_threaded(self, key: bytes, val: bytes):
         self.fh_data.seek(0, 2)
 
@@ -153,7 +155,7 @@ class ChestDatabase(MutableMapping):
         self._index[key] = pos
         # self._commit()
 
-    def _setval(self, key, val, pos):
+    def _setval_threaded(self, key, val, pos):
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
@@ -232,7 +234,7 @@ class ChestDatabase(MutableMapping):
         return dat
 
     def __delitem__(self, key) -> None:
-        self._modified = True
+        # self._modified 
 
         pos = self._index.pop(key)
         self.fh_data.seek(pos)
@@ -240,7 +242,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(4), "big", signed=True)
         self._setfree(pos, siz)
 
-        # self._commit()
+        self._commit()
 
     def __enter__(self):
         return self
@@ -251,12 +253,13 @@ class ChestDatabase(MutableMapping):
     def close(self, exc_type, exc_value, exc_traceback):
         self._commit()
         self._is_running = False
-        while Thread._count() != 1:
+        while _count() != 1:
             sleep(0)
         self.fh_index.flush()
         self.fh_data.flush()
         self.fh_data.close()
         self.fh_index.close()
+
     __exit__ = close
 
     def _setfree(self, pos, siz):
@@ -280,8 +283,8 @@ class ChestDatabase(MutableMapping):
         self.fh_data.seek(pos)
         self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
         self.fh_data.write(b"\0" * siz)
-        # if siz < 220: # block is too small, no use to keep checking, add to fragments list, can be used later
-        #     return
+        if siz < 220: # block is too small, no use to keep checking, add to fragments list, can be used later
+            return
         self._free_space.append((pos, siz))
 
     def __len__(self):
