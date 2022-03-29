@@ -1,4 +1,5 @@
 import _thread as Thread
+from _thread import _count
 import os
 from pathlib import Path
 from threading import Event
@@ -94,7 +95,6 @@ class ChestDatabase(MutableMapping):
             self.fh_data = self._datafile.open("rb", buffering=0)
 
     def _load(self):
-        # ?: needs a way to populate free_blocks
         self._populate_free_blocks()
 
         try:
@@ -120,13 +120,7 @@ class ChestDatabase(MutableMapping):
                 size = ~size
                 pos = self.fh_data.tell()
                 self._setfree(pos - 4, size)
-            try:
                 self.fh_data.seek(size, 1)
-            except OSError:
-                print("oops")
-
-        print(self._free_space)
-        # pass
 
     def _commit(self):
         self._modified.set()
@@ -138,14 +132,14 @@ class ChestDatabase(MutableMapping):
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        self._commit()
+        # self._commit()
 
     def _setval(self, key, val, pos):
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        self._commit()
+        # self._commit()
 
     def __setitem__(self, key, value):
         # todo handle input checks
@@ -209,9 +203,14 @@ class ChestDatabase(MutableMapping):
         pos = self._index[key]  # may raise KeyError
 
         self.fh_data.seek(pos)
-        dat = memoryview(self.fh_data.read(512))
-        siz = dat[0:4]
-        dat = dat[4 : int.from_bytes(siz, "big", signed=True) + 4]
+        dat = self.fh_data.read(512)
+
+        siz = int.from_bytes(dat[0:4], "big", signed=True)
+
+        if siz > (508):
+            dat += self.fh_data.read(siz-508)
+
+        dat = dat[4 : siz + 4]
         return dat
 
     def __delitem__(self, key) -> None:
@@ -263,7 +262,6 @@ class ChestDatabase(MutableMapping):
 
         self.fh_data.seek(pos)
         self.fh_data.write((~siz).to_bytes(4, "big", signed=True))
-        self.fh_data.write(b"\0" * siz)
         # if siz < 220: # block is too small, no use to keep checking, add to fragments list, can be used later
         #     return
         self._free_space.append((pos, siz))
@@ -272,10 +270,10 @@ class ChestDatabase(MutableMapping):
         raise NotImplemented
 
     def _threaded_index_writer(self):
-        # with self._shutdown_lock:
-        while self._is_running:
-            self._modified.wait()
-            self.fh_index.seek(0)
-            self.fh_index.write(self._encoder.encode(self._index))
-            self.fh_index.truncate()
-            self._modified.clear()
+        with self._shutdown_lock:
+            while self._is_running:
+                self._modified.wait()
+                self.fh_index.seek(0)
+                self.fh_index.write(self._encoder.encode(self._index))
+                self.fh_index.truncate()
+                self._modified.clear()
