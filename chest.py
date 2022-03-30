@@ -24,6 +24,9 @@ class ChestDatabase(MutableMapping):
     PREFIX_SIZE = 0x04
     BUFFER_SIZE = 0x200
     MIN_BLOCKSIZE = 0x10
+    FIXMAP = 0x80
+    MAP_16 = 0xDE
+    MAP_32 = 0xDF
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
 
@@ -114,6 +117,20 @@ class ChestDatabase(MutableMapping):
     def _commit(self):
         self._index_writer()
 
+    def _commit_append(self, key: int | str | bytes):
+        """Optimized version of the commit method, made for appending a new entry."""
+        if (size := (len(self._index))) <= 65536:
+            self.fh_index.seek(0)
+            self.fh_index.write(
+                self.MAP_16.to_bytes(1, "big") + (size).to_bytes(2, "big", signed=False)
+            )
+
+        self.fh_index.seek(0, 2)
+
+        self._encoder.encode_into(key, self._buffer)
+        self._encoder.encode_into(self._index[key], self._buffer, -1)
+        self.fh_index.write(self._buffer)
+
     def _index_writer(self):
         self.fh_index.seek(0)
         self._encoder.encode_into(self._index, self._buffer)
@@ -125,18 +142,17 @@ class ChestDatabase(MutableMapping):
 
         pos = self.fh_data.tell()
         self.fh_data.write(lenb(val) + val)
-
         self._index[key] = pos
-        # self._commit()
+        self._commit_append(key)
 
     def _setval(self, key, val: bytes, pos: int):
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
         self._index[key] = pos
-        # self._commit()
+        self._commit()
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: int | str | bytes) -> bytes:
 
         pos = self._index[key]  # may raise KeyError
 
@@ -160,7 +176,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(self.fh_data.read(self.PREFIX_SIZE), "big", signed=True)
         self._setfree(pos, siz)
 
-        # self._commit()
+        self._commit_delete(key)
 
     def __setitem__(self, key: int | str | bytes, value: bytes):
 
