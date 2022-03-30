@@ -1,9 +1,5 @@
-import _thread as Thread
-from _thread import _count
 import os
 from pathlib import Path
-from threading import Event
-# from threading import enumerate as threads
 from typing import Dict, List, Literal, MutableMapping, Tuple
 from time import sleep
 from msgspec import DecodeError
@@ -37,13 +33,6 @@ class ChestDatabase(MutableMapping):
     MIN_BLOCK_SIZE = 0x04
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
-        #threading stuff
-        self._shutdown_lock = Thread.allocate_lock()
-
-        self._modified: Event = Event()
-        self._data_modified: Event = Event()
-
-        self._is_running = True
         # _indexfile contains the indexes with their respective locations in the _datafile,
         # _datafile contains all the data in binary format pointed to by _indexfile.
         self._indexfile: Path = path
@@ -69,8 +58,6 @@ class ChestDatabase(MutableMapping):
         self._check()
         self._load()
 
-        Thread.start_new_thread(self._threaded_index_writer, ())
-
     def _check(self):
         if not self._mode in {"r", "r+"}:
             raise AttributeError(
@@ -88,8 +75,12 @@ class ChestDatabase(MutableMapping):
                 )
 
         if self._mode == "r+":
-            self.fh_index = open(self._indexfile, "rb+", buffering=0, opener=index_optimised)
-            self.fh_data = open(self._datafile, "rb+", buffering=0, opener=data_optimised)
+            self.fh_index = open(
+                self._indexfile, "rb+", buffering=0, opener=index_optimised
+            )
+            self.fh_data = open(
+                self._datafile, "rb+", buffering=0, opener=data_optimised
+            )
         else:
             self.fh_index = self._indexfile.open("rb", buffering=0)
             self.fh_data = self._datafile.open("rb", buffering=0)
@@ -123,7 +114,7 @@ class ChestDatabase(MutableMapping):
                 self.fh_data.seek(size, 1)
 
     def _commit(self):
-        self._modified.set()
+        self._index_writer()
 
     def _addval(self, key: bytes, val: bytes):
         self.fh_data.seek(0, 2)
@@ -147,7 +138,9 @@ class ChestDatabase(MutableMapping):
         if key in self._index:
             old_pos = self._index[key]  # pos from index
             self.fh_data.seek(old_pos)  # go to pos
-            old_size = int.from_bytes(self.fh_data.read(4), "big", signed=False)  # read size from data file
+            old_size = int.from_bytes(
+                self.fh_data.read(4), "big", signed=False
+            )  # read size from data file
 
             if new_size > old_size:  # bigger
 
@@ -162,7 +155,9 @@ class ChestDatabase(MutableMapping):
                 self._setfree(old_pos, old_size)
 
             elif new_size < old_size:  # smaller
-                if (free := (old_size - new_size)) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
+                if (
+                    free := (old_size - new_size)
+                ) > 4:  # there should be at least 5 bytes of free space because 4 are used for storing size
                     self._setval(key, value, old_pos)
                     new_free_pos = old_pos + new_size + 4
                     new_free_size = free - 4
@@ -208,7 +203,7 @@ class ChestDatabase(MutableMapping):
         siz = int.from_bytes(dat[0:4], "big", signed=True)
 
         if siz > (508):
-            dat += self.fh_data.read(siz-508)
+            dat += self.fh_data.read(siz - 508)
 
         dat = dat[4 : siz + 4]
         return dat
@@ -232,9 +227,6 @@ class ChestDatabase(MutableMapping):
 
     def close(self, exc_type, exc_value, exc_traceback):
         self._commit()
-        self._is_running = False
-        while Thread._count() != 1: sleep(0)
-        self._shutdown_lock.acquire()
         self.fh_index.flush()
         self.fh_data.flush()
         self.fh_data.close()
@@ -269,11 +261,7 @@ class ChestDatabase(MutableMapping):
     def __len__(self):
         raise NotImplemented
 
-    def _threaded_index_writer(self):
-        with self._shutdown_lock:
-            while self._is_running:
-                self._modified.wait()
-                self.fh_index.seek(0)
-                self.fh_index.write(self._encoder.encode(self._index))
-                self.fh_index.truncate()
-                self._modified.clear()
+    def _index_writer(self):
+        self.fh_index.seek(0)
+        self.fh_index.write(self._encoder.encode(self._index))
+        self.fh_index.truncate()
