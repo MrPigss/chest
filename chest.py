@@ -1,14 +1,13 @@
 from functools import partial
-from mmap import mmap, ACCESS_READ, ACCESS_WRITE
+from mmap import mmap, ACCESS_READ
 import os
 from pathlib import Path
-from typing import Dict, List, Literal, MutableMapping, Tuple
+from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
 from struct import Struct
 from msgspec import DecodeError
 from msgspec.msgpack import Decoder, Encoder
 
 base_flags = os.O_CREAT | os.O_RDWR | os.O_BINARY
-
 
 def lenb(bytes: bytes):
     return len(bytes).to_bytes(4, "big", signed=False)
@@ -21,8 +20,94 @@ def index_optimised(path, flags):
 def data_optimised(path, flags):
     return os.open(path, flags | base_flags | os.O_RANDOM)
 
+class _RO_ChestDatabase(Mapping):
+    BUFFER_SIZE = 0x200
+    PREFIX_SIZE = 0x04
 
-class ChestDatabase(MutableMapping):
+    def __init__(self, path: Path):
+
+        # _indexfile contains the indexes with their respective locations in the _datafile,
+        # _datafile contains all the data in binary format pointed to by _indexfile.
+        self._indexfile: Path = path
+        self._datafile: Path = path.with_suffix(".bin")
+
+        # The index is an in-memory dict, mirroring the index file.
+        # It maps indexes to their position in the datafile
+        self._index: Dict[str | bytes | int, int] = dict()
+
+        # initializing an encoder and decoder wich will be used for the index.
+        self._decoder = Decoder(Dict[str | bytes | int, int])
+
+        # initializing a packer and unpacker wich will be used for the index.
+        self._row_struct = Struct("II")
+        self._row_unpack = self._row_struct.unpack
+
+        # checks that everything exists
+        self._check()
+        self._load()
+
+    def _check(self):
+
+        if not isinstance(self._indexfile, Path):
+            raise TypeError("path is not an instance of pathlib.Path")
+
+        if not self._indexfile.exists():
+            raise FileNotFoundError(
+                f"""File can't be found, use access_mode='r+' if you wan to create it.\nPath: <{self._indexfile.absolute()}>,
+                    """
+            )
+
+        self._indexfile = self._indexfile.open("rb", buffering=0)
+        self._datafile = self._datafile.open("rb", buffering=0)
+        self.fh_index = mmap(self._indexfile.fileno(), 0,  access=ACCESS_READ)
+        self.fh_data = mmap(self._datafile.fileno(), 0,  access=ACCESS_READ)
+
+    def _load(self):
+        try:
+            self.fh_index.seek(0)
+            self._index = self._decoder.decode(self.fh_index.read())
+
+        except DecodeError:
+
+            self.fh_index.seek(0)
+            if self.fh_index.read():
+                raise DecodeError("Index might be corrupt.")
+
+            pass
+
+    def __getitem__(self, key: int | str | bytes) -> bytes:
+
+        pos = self._index[key]  # may raise KeyError
+
+        self.fh_data.seek(pos)
+        dat = self.fh_data.read(self.BUFFER_SIZE)
+
+        siz = int.from_bytes(dat[: self.PREFIX_SIZE], "big", signed=True)
+
+        if siz > (x := (self.BUFFER_SIZE - self.PREFIX_SIZE)):
+            dat += self.fh_data.read(siz - x)
+
+        dat = dat[self.PREFIX_SIZE : siz + self.PREFIX_SIZE]
+        return dat
+
+    def __enter__(self):
+        return self
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def close(self, t, v, tr):
+        self._indexfile.close()
+        self._datafile.close()
+        self.fh_data.close()
+        self.fh_index.close()
+
+    __exit__ = close
+
+    def __len__(self) -> int:
+        return super().__len__()
+
+class _RW_ChestDatabase(MutableMapping):
     PREFIX_SIZE = 0x04
     BUFFER_SIZE = 0x200
     MIN_BLOCKSIZE = 0x10
@@ -67,33 +152,16 @@ class ChestDatabase(MutableMapping):
         self._load()
 
     def _check(self):
-        if not self._mode in {"r", "r+"}:
-            raise AttributeError(
-                f'access_mode is not one of ("r", "r+"), :{self._mode}'
-            )
-
         if not isinstance(self._indexfile, Path):
             raise TypeError("path is not an instance of pathlib.Path")
 
-        if not self._indexfile.exists():
-            if self._mode == "r":
-                raise FileNotFoundError(
-                    f"""File can't be found, use access_mode='r+' if you wan to create it.\nPath: <{self._indexfile.absolute()}>,
-                        """
-                )
+        self.fh_index = open(
+            self._indexfile, "rb+", buffering=0, opener=index_optimised
+        )
+        self.fh_data = open(
+            self._datafile, "rb+", buffering=0, opener=data_optimised
+        )
 
-        if self._mode == "r+":
-            self.fh_index = open(
-                self._indexfile, "rb+", buffering=0, opener=index_optimised
-            )
-            self.fh_data = open(
-                self._datafile, "rb+", buffering=0, opener=data_optimised
-            )
-        else:
-            self.fh_index = self._indexfile.open("rb", buffering=0)
-            # f = self._datafile.open("rb", buffering=0)
-            # self.fh_data = mmap(f.fileno(), 0,  access=ACCESS_READ)
-            self.fh_data = self._datafile.open("rb", buffering=0)
 
     def _load(self):
         self._populate_free_blocks()
@@ -286,10 +354,9 @@ class ChestDatabase(MutableMapping):
         return iter(self._index)
 
     def close(self, t, v, tr):
-        if self._mode == 'r+':
-            self._commit()
-            self.fh_index.flush()
-            self.fh_data.flush()
+        self._commit()
+        self.fh_index.flush()
+        self.fh_data.flush()
         self.fh_data.close()
         self.fh_index.close()
 
@@ -302,3 +369,13 @@ class ChestDatabase(MutableMapping):
 class PersistentDict:
     def __init__(self):
         pass
+
+def ChestDatabase(path: Path, mode: Literal["r", "r+"]=None):
+    if not mode in {"r", "r+"}:
+        raise AttributeError(
+            f'access_mode is not one of ("r", "r+"), :{mode}'
+        )
+    if mode == 'r':
+        return _RO_ChestDatabase(path)
+    else:
+        return _RW_ChestDatabase(path)
