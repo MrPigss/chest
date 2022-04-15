@@ -94,31 +94,27 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
         super().__init__(path)
-        # A buffer to write the encoded messagepack bytes into
-        self._buffer: bytearray = bytearray()
-
         # free_blocks keep track of the free blocks in the file.
         # These free bocks might be reused later on.
         # fragments are blocks that can't be reused, (too small).
         self._free_space: List[Tuple[int, int]] = []
         self._fragments: List[Tuple[int, int]] = []
 
-        # initializing an encoder and decoder wich will be used for the index.
-        self._decoder = Decoder(Dict[str | bytes | int, int])
-        self._encoder = Encoder()
-
         # initializing a packer and unpacker wich will be used for the index.
         self._row_struct = Struct("II")
-        self._row_pack = partial(self._row_struct.pack_into, self._buffer)
+        self._row_pack = self._row_struct.pack
         self._row_unpack = self._row_struct.iter_unpack
+        self._buffer = bytearray()
 
         self._indexfile.touch(exist_ok=True)
         self._datafile.touch(exist_ok=True)
 
         self.fh_index = self._indexfile.open('rb+', buffering=0)
         self.fh_data = self._datafile.open('rb+', buffering=0)
+        self._buffer = bytearray(self.fh_index.read())
+        self._index = dict(self._row_unpack(self._buffer))
 
-        self._index = dict(self._row_unpack(self.fh_index.read()))
+        self._populate_free_blocks()
 
     def _populate_free_blocks(self):
         self.fh_data.seek(0)
@@ -134,50 +130,31 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
                 self._setfree(pos - 4, size)
             self.fh_data.seek(size, 1)
 
-    def _commit(self):
-        self._index_writer()
-
-    def _commit_append(self, key: int | str | bytes):
-        """Optimized version of the commit method, made for appending a new entry."""
-        # if (size := (len(self._index))) <= 65536:
-        #     self.fh_index.seek(0)
-        #     self.fh_index.write(
-        #         self.MAP_16.to_bytes(1, byteorder) + (size).to_bytes(2, byteorder, signed=False)
-        #     )
-
-        # self.fh_index.seek(0, 2)
-
-        # self._encoder.encode_into(key, self._buffer)
-        # self._encoder.encode_into(self._index[key], self._buffer, -1)
-        # self.fh_index.write(self._buffer)
-        self._index_writer()
-    def _index_writer(self):
-        s = self._row_struct.size
-        if len(self._index) * s > len(self._buffer):
-            self._buffer.extend(b"\0" * ((len(self._index) * s) - len(self._buffer)))
-        j = 0
-        for i in self._index:
-            self._row_pack(s * j, i, self._index[i])
-            j += 1
+    def commit(self, cleanup=False):
+        if cleanup:
+            for i,k in enumerate(self._index):
+                self._buffer[i*8:] = self._row_pack(k,self._index[k])
 
         self.fh_index.seek(0)
         self.fh_index.write(self._buffer)
-        self.fh_index.truncate()
+        if cleanup:
+            self.fh_index.truncate(len(self._index)*8)
 
     def _addval(self, key, val: bytes):
         self.fh_data.seek(0, 2)
 
         pos = self.fh_data.tell()
         self.fh_data.write(lenb(val) + val)
+        self._buffer.extend(self._row_pack(key,pos))
         self._index[key] = pos
-        # self._commit_append(key)
 
     def _setval(self, key, val: bytes, pos: int):
         self.fh_data.seek(pos)
         self.fh_data.write(lenb(val) + val)
 
+        self._buffer.extend(self._row_pack(key,pos))
         self._index[key] = pos
-        # self._commit()
+
 
     def __getitem__(self, key: int | str | bytes) -> bytes:
 
@@ -195,15 +172,11 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         return dat
 
     def __delitem__(self, key) -> None:
-        self._modified = True
-
         pos = self._index.pop(key)
         self.fh_data.seek(pos)
 
         siz = int.from_bytes(self.fh_data.read(self.PREFIX_SIZE), byteorder, signed=True)
         self._setfree(pos, siz)
-
-        # self._commit()
 
     def __setitem__(self, key: int | str | bytes, value: bytes):
 
@@ -304,7 +277,7 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         return iter(self._index)
 
     def close(self, t, v, tr):
-        self._commit()
+        self.commit(cleanup=True)
         self.fh_index.flush()
         self.fh_data.flush()
         self.fh_data.close()
