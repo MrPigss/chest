@@ -142,7 +142,7 @@ class _RW_ChestDatabase(MutableMapping):
         # initializing a packer and unpacker wich will be used for the index.
         self._row_struct = Struct("II")
         self._row_pack = partial(self._row_struct.pack_into, self._buffer)
-        self._row_unpack = self._row_struct.unpack
+        self._row_unpack = self._row_struct.iter_unpack
 
         # checks that everything exists
         self._check()
@@ -158,19 +158,9 @@ class _RW_ChestDatabase(MutableMapping):
         self.fh_data = open(self._datafile, "rb+", buffering=0, opener=data_optimised)
 
     def _load(self):
-        self._populate_free_blocks()
-
-        try:
-            self.fh_index.seek(0)
-            self._index = self._decoder.decode(self.fh_index.read())
-
-        except DecodeError:
-
-            self.fh_index.seek(0)
-            if self.fh_index.read():
-                raise DecodeError("Index might be corrupt.")
-
-            pass
+        start = perf_counter()
+        self._index = dict(self._row_unpack(self.fh_index.read()))
+        print(perf_counter() - start)
 
     def _populate_free_blocks(self):
         self.fh_data.seek(0)
