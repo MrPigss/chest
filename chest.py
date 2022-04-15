@@ -2,12 +2,15 @@ from functools import partial
 from mmap import mmap, ACCESS_READ
 import os
 from pathlib import Path
+from re import S
 from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
 from struct import Struct
 from msgspec import DecodeError
 from msgspec.msgpack import Decoder, Encoder
+from time import perf_counter
 
 base_flags = os.O_CREAT | os.O_RDWR | os.O_BINARY
+
 
 def lenb(bytes: bytes):
     return len(bytes).to_bytes(4, "big", signed=False)
@@ -19,6 +22,7 @@ def index_optimised(path, flags):
 
 def data_optimised(path, flags):
     return os.open(path, flags | base_flags | os.O_RANDOM)
+
 
 class _RO_ChestDatabase(Mapping):
     BUFFER_SIZE = 0x200
@@ -40,7 +44,7 @@ class _RO_ChestDatabase(Mapping):
 
         # initializing a packer and unpacker wich will be used for the index.
         self._row_struct = Struct("II")
-        self._row_unpack = self._row_struct.unpack
+        self._row_unpack = self._row_struct.iter_unpack
 
         # checks that everything exists
         self._check()
@@ -59,21 +63,13 @@ class _RO_ChestDatabase(Mapping):
 
         self._indexfile = self._indexfile.open("rb", buffering=0)
         self._datafile = self._datafile.open("rb", buffering=0)
-        self.fh_index = mmap(self._indexfile.fileno(), 0,  access=ACCESS_READ)
-        self.fh_data = mmap(self._datafile.fileno(), 0,  access=ACCESS_READ)
+        self.fh_index = mmap(self._indexfile.fileno(), 0, access=ACCESS_READ)
+        self.fh_data = mmap(self._datafile.fileno(), 0, access=ACCESS_READ)
 
     def _load(self):
-        try:
-            self.fh_index.seek(0)
-            self._index = self._decoder.decode(self.fh_index.read())
-
-        except DecodeError:
-
-            self.fh_index.seek(0)
-            if self.fh_index.read():
-                raise DecodeError("Index might be corrupt.")
-
-            pass
+        start = perf_counter()
+        self._index = dict(self._row_unpack(self.fh_index.read()))
+        print(perf_counter() - start)
 
     def __getitem__(self, key: int | str | bytes) -> bytes:
 
@@ -107,6 +103,7 @@ class _RO_ChestDatabase(Mapping):
     def __len__(self) -> int:
         return super().__len__()
 
+
 class _RW_ChestDatabase(MutableMapping):
     PREFIX_SIZE = 0x04
     BUFFER_SIZE = 0x200
@@ -130,7 +127,7 @@ class _RW_ChestDatabase(MutableMapping):
         self._index: Dict[str | bytes | int, int] = dict()
 
         # A buffer to write the encoded messagepack bytes into
-        self._buffer: bytearray = bytearray(8)
+        self._buffer: bytearray = bytearray()
 
         # free_blocks keep track of the free blocks in the file.
         # These free bocks might be reused later on.
@@ -158,10 +155,7 @@ class _RW_ChestDatabase(MutableMapping):
         self.fh_index = open(
             self._indexfile, "rb+", buffering=0, opener=index_optimised
         )
-        self.fh_data = open(
-            self._datafile, "rb+", buffering=0, opener=data_optimised
-        )
-
+        self.fh_data = open(self._datafile, "rb+", buffering=0, opener=data_optimised)
 
     def _load(self):
         self._populate_free_blocks()
@@ -188,7 +182,8 @@ class _RW_ChestDatabase(MutableMapping):
             if size < 0:
                 size = ~size
                 pos = self.fh_data.tell()
-                # self._setfree(pos - 4, size)
+                # todo fix redundant shizzle
+                self._setfree(pos - 4, size)
             self.fh_data.seek(size, 1)
 
     def _commit(self):
@@ -209,8 +204,15 @@ class _RW_ChestDatabase(MutableMapping):
         self.fh_index.write(self._buffer)
 
     def _index_writer(self):
+        s = self._row_struct.size
+        if len(self._index) * s > len(self._buffer):
+            self._buffer.extend(b"\0" * ((len(self._index) * s) - len(self._buffer)))
+        j = 0
+        for i in self._index:
+            self._row_pack(s * j, i, self._index[i])
+            j += 1
+
         self.fh_index.seek(0)
-        self._encoder.encode_into(self._index, self._buffer)
         self.fh_index.write(self._buffer)
         self.fh_index.truncate()
 
@@ -370,12 +372,9 @@ class PersistentDict:
     def __init__(self):
         pass
 
-def ChestDatabase(path: Path, mode: Literal["r", "r+"]=None):
+
+def ChestDatabase(path: Path, mode: Literal["r", "r+"] = None):
     if not mode in {"r", "r+"}:
-        raise AttributeError(
-            f'access_mode is not one of ("r", "r+"), :{mode}'
-        )
-    if mode == 'r':
-        return _RO_ChestDatabase(path)
-    else:
-        return _RW_ChestDatabase(path)
+        raise AttributeError(f'access_mode is not one of ("r", "r+"), :{mode}')
+
+    return _RO_ChestDatabase(path) if mode == "r" else _RW_ChestDatabase(path)
