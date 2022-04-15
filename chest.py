@@ -1,34 +1,30 @@
-from functools import partial
-from mmap import mmap, ACCESS_READ
 import os
+from functools import partial
+from mmap import ACCESS_READ, mmap
 from pathlib import Path
-from re import S
-from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
-from struct import Struct
-from msgspec import DecodeError
-from msgspec.msgpack import Decoder, Encoder
+from struct import Struct, unpack_from
+from sys import byteorder
 from time import perf_counter
+from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
+
+from msgspec.msgpack import Decoder, Encoder
 
 base_flags = os.O_CREAT | os.O_RDWR | os.O_BINARY
 
 
 def lenb(bytes: bytes):
-    return len(bytes).to_bytes(4, "big", signed=False)
+    return len(bytes).to_bytes(4, byteorder, signed=False)
 
 
-def index_optimised(path, flags):
-    return os.open(path, flags | base_flags | os.O_SEQUENTIAL)
+class _BaseChestDB:
 
-
-def data_optimised(path, flags):
-    return os.open(path, flags | base_flags | os.O_RANDOM)
-
-
-class _RO_ChestDatabase(Mapping):
     BUFFER_SIZE = 0x200
     PREFIX_SIZE = 0x04
 
     def __init__(self, path: Path):
+
+        if not isinstance(path, Path):
+            raise TypeError("path is not an instance of pathlib.Path")
 
         # _indexfile contains the indexes with their respective locations in the _datafile,
         # _datafile contains all the data in binary format pointed to by _indexfile.
@@ -39,52 +35,36 @@ class _RO_ChestDatabase(Mapping):
         # It maps indexes to their position in the datafile
         self._index: Dict[str | bytes | int, int] = dict()
 
-        # initializing an encoder and decoder wich will be used for the index.
-        self._decoder = Decoder(Dict[str | bytes | int, int])
 
-        # initializing a packer and unpacker wich will be used for the index.
-        self._row_struct = Struct("II")
-        self._row_unpack = self._row_struct.iter_unpack
-
-        # checks that everything exists
-        self._check()
-        self._load()
-
-    def _check(self):
-
-        if not isinstance(self._indexfile, Path):
-            raise TypeError("path is not an instance of pathlib.Path")
+class _RO_ChestDatabase(_BaseChestDB, Mapping):
+    def __init__(self, path: Path):
+        super().__init__(path)
 
         if not self._indexfile.exists():
             raise FileNotFoundError(
                 f"""File can't be found, use access_mode='r+' if you wan to create it.\nPath: <{self._indexfile.absolute()}>,
                     """
             )
+        # initializing a packer and unpacker wich will be used for the index.
+        self._row_struct = Struct("II")
+        self._row_unpack = self._row_struct.iter_unpack
 
         self._indexfile = self._indexfile.open("rb", buffering=0)
         self._datafile = self._datafile.open("rb", buffering=0)
+
         self.fh_index = mmap(self._indexfile.fileno(), 0, access=ACCESS_READ)
         self.fh_data = mmap(self._datafile.fileno(), 0, access=ACCESS_READ)
 
-    def _load(self):
-        start = perf_counter()
         self._index = dict(self._row_unpack(self.fh_index.read()))
-        print(perf_counter() - start)
 
     def __getitem__(self, key: int | str | bytes) -> bytes:
 
         pos = self._index[key]  # may raise KeyError
-
         self.fh_data.seek(pos)
-        dat = self.fh_data.read(self.BUFFER_SIZE)
+        siz = unpack_from('I', self.fh_data[:4])[0]
 
-        siz = int.from_bytes(dat[: self.PREFIX_SIZE], "big", signed=True)
+        return self.fh_data[pos + 4:pos + siz + 4]
 
-        if siz > (x := (self.BUFFER_SIZE - self.PREFIX_SIZE)):
-            dat += self.fh_data.read(siz - x)
-
-        dat = dat[self.PREFIX_SIZE : siz + self.PREFIX_SIZE]
-        return dat
 
     def __enter__(self):
         return self
@@ -104,7 +84,7 @@ class _RO_ChestDatabase(Mapping):
         return super().__len__()
 
 
-class _RW_ChestDatabase(MutableMapping):
+class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
     PREFIX_SIZE = 0x04
     BUFFER_SIZE = 0x200
     MIN_BLOCKSIZE = 0x10
@@ -113,19 +93,7 @@ class _RW_ChestDatabase(MutableMapping):
     MAP_32 = 0xDF
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
-
-        # _indexfile contains the indexes with their respective locations in the _datafile,
-        # _datafile contains all the data in binary format pointed to by _indexfile.
-        self._indexfile: Path = path
-        self._datafile: Path = path.with_suffix(".bin")
-
-        # writemode, readonly or read and write.
-        self._mode = mode
-
-        # The index is an in-memory dict, mirroring the index file.
-        # It maps indexes to their position in the datafile
-        self._index: Dict[str | bytes | int, int] = dict()
-
+        super().__init__(path)
         # A buffer to write the encoded messagepack bytes into
         self._buffer: bytearray = bytearray()
 
@@ -144,30 +112,20 @@ class _RW_ChestDatabase(MutableMapping):
         self._row_pack = partial(self._row_struct.pack_into, self._buffer)
         self._row_unpack = self._row_struct.iter_unpack
 
-        # checks that everything exists
-        self._check()
-        self._load()
+        self._indexfile.touch(exist_ok=True)
+        self._datafile.touch(exist_ok=True)
 
-    def _check(self):
-        if not isinstance(self._indexfile, Path):
-            raise TypeError("path is not an instance of pathlib.Path")
+        self.fh_index = self._indexfile.open('rb+', buffering=0)
+        self.fh_data = self._datafile.open('rb+', buffering=0)
 
-        self.fh_index = open(
-            self._indexfile, "rb+", buffering=0, opener=index_optimised
-        )
-        self.fh_data = open(self._datafile, "rb+", buffering=0, opener=data_optimised)
-
-    def _load(self):
-        start = perf_counter()
         self._index = dict(self._row_unpack(self.fh_index.read()))
-        print(perf_counter() - start)
 
     def _populate_free_blocks(self):
         self.fh_data.seek(0)
 
         while len((block := self.fh_data.read(4))) == 4:
 
-            size = int.from_bytes(block, "big", signed=True)
+            size = int.from_bytes(block, byteorder, signed=True)
 
             if size < 0:
                 size = ~size
@@ -181,18 +139,18 @@ class _RW_ChestDatabase(MutableMapping):
 
     def _commit_append(self, key: int | str | bytes):
         """Optimized version of the commit method, made for appending a new entry."""
-        if (size := (len(self._index))) <= 65536:
-            self.fh_index.seek(0)
-            self.fh_index.write(
-                self.MAP_16.to_bytes(1, "big") + (size).to_bytes(2, "big", signed=False)
-            )
+        # if (size := (len(self._index))) <= 65536:
+        #     self.fh_index.seek(0)
+        #     self.fh_index.write(
+        #         self.MAP_16.to_bytes(1, byteorder) + (size).to_bytes(2, byteorder, signed=False)
+        #     )
 
-        self.fh_index.seek(0, 2)
+        # self.fh_index.seek(0, 2)
 
-        self._encoder.encode_into(key, self._buffer)
-        self._encoder.encode_into(self._index[key], self._buffer, -1)
-        self.fh_index.write(self._buffer)
-
+        # self._encoder.encode_into(key, self._buffer)
+        # self._encoder.encode_into(self._index[key], self._buffer, -1)
+        # self.fh_index.write(self._buffer)
+        self._index_writer()
     def _index_writer(self):
         s = self._row_struct.size
         if len(self._index) * s > len(self._buffer):
@@ -228,7 +186,7 @@ class _RW_ChestDatabase(MutableMapping):
         self.fh_data.seek(pos)
         dat = self.fh_data.read(self.BUFFER_SIZE)
 
-        siz = int.from_bytes(dat[: self.PREFIX_SIZE], "big", signed=True)
+        siz = int.from_bytes(dat[: self.PREFIX_SIZE], byteorder, signed=True)
 
         if siz > (x := (self.BUFFER_SIZE - self.PREFIX_SIZE)):
             dat += self.fh_data.read(siz - x)
@@ -242,7 +200,7 @@ class _RW_ChestDatabase(MutableMapping):
         pos = self._index.pop(key)
         self.fh_data.seek(pos)
 
-        siz = int.from_bytes(self.fh_data.read(self.PREFIX_SIZE), "big", signed=True)
+        siz = int.from_bytes(self.fh_data.read(self.PREFIX_SIZE), byteorder, signed=True)
         self._setfree(pos, siz)
 
         # self._commit()
@@ -260,7 +218,7 @@ class _RW_ChestDatabase(MutableMapping):
             old_pos = self._index[key]  # pos from index
             self.fh_data.seek(old_pos)  # go to pos
             old_size = int.from_bytes(
-                self.fh_data.read(self.PREFIX_SIZE), "big", signed=False
+                self.fh_data.read(self.PREFIX_SIZE), byteorder, signed=False
             )  # read size from data file
 
             if new_size > old_size:  # bigger
@@ -328,7 +286,7 @@ class _RW_ChestDatabase(MutableMapping):
                 break
 
         self.fh_data.seek(pos)
-        self.fh_data.write((~siz).to_bytes(self.PREFIX_SIZE, "big", signed=True))
+        self.fh_data.write((~siz).to_bytes(self.PREFIX_SIZE, byteorder, signed=True))
 
         if (
             siz < self.MIN_BLOCKSIZE
@@ -366,5 +324,4 @@ class PersistentDict:
 def ChestDatabase(path: Path, mode: Literal["r", "r+"] = None):
     if not mode in {"r", "r+"}:
         raise AttributeError(f'access_mode is not one of ("r", "r+"), :{mode}')
-
     return _RO_ChestDatabase(path) if mode == "r" else _RW_ChestDatabase(path)
