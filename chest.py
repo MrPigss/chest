@@ -6,7 +6,7 @@ from sys import byteorder
 from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
 
 data_struct = Struct("i") # signed int 32
-index_struct = Struct("II")
+index_struct = Struct("II") # two Uint 32's
 
 pack = data_struct.pack
 unpack = data_struct.unpack
@@ -114,30 +114,34 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         self._populate_free_blocks()
 
     def _populate_free_blocks(self):
-        self.fh_data.seek(0)
-        while self.fh_data.readinto(buf) == 4:
-            size = unpack(buf)[0] #has to be signed
+        data = self.fh_data
+        buff = buf
+        data.seek(0)
+
+        while data.readinto(buff) == 4:
+            size = unpack(buff)[0] #has to be signed
 
             if size < 0:
                 size = ~size
-                pos = self.fh_data.tell()
+                pos = data.tell()
                 # todo fix redundant shizzle
                 self._setfree(pos - 4, size)
-            self.fh_data.seek(size, 1)
+            data.seek(size, 1)
 
     def commit(self, cleanup=False):
 
         if cleanup:
-            # for i, k in enumerate(self._index):
-            #     self._buffer[i * 8 :] = self._row_pack(k, self._index[k])
+            # putting everything in local scope speeds up the loop by 30%
+            ind = self._index
+            buf = self._buffer
+            p = self._row_pack_into
 
-            # probably no speedup, even slower but test it out
-            buf = memoryview(self._buffer)
-            for i, k in enumerate(self._index):
-                self._row_pack_into(buf, i * 8, k, self._index[k])
+            for i, k in enumerate(ind):
+                p(buf, i * 8, k, ind[k])
 
         self.fh_index.seek(0)
         self.fh_index.write(self._buffer)
+
         if cleanup:
             self.fh_index.truncate(len(self._index) * 8)
 
@@ -217,15 +221,16 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
                 self._addval(key, value)
 
     def _claim_free_space(self, size) -> int:
-        for i, block in enumerate(self._free_space):
+        fspce = self._free_space
+        for i, block in enumerate(fspce):
             free_pos, free_size = block
 
             if size == free_size:
-                del self._free_space[i]
+                del fspce[i]
                 return free_pos
 
             if size < free_size:
-                del self._free_space[i]
+                del fspce[i]
                 new_free_pos = free_pos + size + self.PREFIX_SIZE
                 new_free_size = free_size - size - self.PREFIX_SIZE
                 self._setfree(new_free_pos, new_free_size)
@@ -237,28 +242,25 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
             # check for free blocks before new free block
             if 4 + sum(free) == pos:
                 pos = free[0]
-                siz = siz + free[1] + self.PREFIX_SIZE
+                siz += free[1] + 4
                 del self._free_space[i]
                 break
 
             # check for free blocks after new free block
-            elif (pos + siz + self.PREFIX_SIZE) == free[0]:
-                siz = siz + free[1] + self.PREFIX_SIZE
+            elif (pos + siz + 4) == free[0]:
+                siz += free[1] + 4
                 del self._free_space[i]
                 break
 
         self.fh_data.seek(pos)
-        # again check struct cast speed compared to tobytes
-        self.fh_data.write((~siz).to_bytes(self.PREFIX_SIZE, byteorder, signed=True))
-
-        if (
-            siz < self.MIN_BLOCKSIZE
-        ):  # block is too small, no use to keep checking, add to fragments list, can be used later
-            self._fragments.append(pos)
-            return
-
+        self.fh_data.write(data_struct.pack(~siz))
         self._free_space.append((pos, siz))
-        return None
+
+        #  block is too small, no use to keep checking, add to fragments list, can be used later
+        # if (siz < self.MIN_BLOCKSIZE): 
+        #     self._fragments.append(pos)
+        #     return
+
 
     def close(self, t, v, tr):
         self.commit(cleanup=True)
