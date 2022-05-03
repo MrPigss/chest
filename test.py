@@ -11,10 +11,12 @@ from chest import ChestDatabase
 avg_times: List[int] = []
 p = Path("testdb.db")
 d = msgpack.Decoder()
-def f():
-    with ChestDatabase(p, "r") as db:
 
-        for i in range(10_000):
+
+def f():
+    with ChestDatabase(p, "r+") as db:
+
+        for i in range(100_000):
             entry = msgpack.encode(
                 {
                     "id": i,
@@ -36,14 +38,11 @@ def f():
             )
             start = perf_counter()
             # db[i] = entry
-            # db.commit()
             db[i]
             avg_times.append(perf_counter() - start)
-        # del db[2]
-        # print(d.decode(db[2342]))
         print(f"{1/(sum(avg_times) / len(avg_times)):.1f} ops/sec, {sum(avg_times):4}")
 
-        # for i in range(5000, 8000):
+        # for i in range(90_000):
         #     del db[i]
 
     # for i in range(4000, 70000):
@@ -58,11 +57,12 @@ def f():
     #         }
     #     )
 
-cProfile.run("f()", "prof/test.prof")
-os.system(
-    f"gprof2dot -n0 -e0 -f pstats ./prof/test.prof | dot -Tpng -o ./prof/test.png"
-)
+
+f()
+# cProfile.run("f()", "prof/test.prof")
+# os.system(
+#     f"gprof2dot -n0 -e0 -f pstats ./prof/test.prof | dot -Tpng -o ./prof/test.png"
+# )
 
 
 # f()
-

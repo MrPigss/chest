@@ -1,19 +1,18 @@
-import os
-from functools import partial
+from io import FileIO
 from mmap import ACCESS_READ, mmap
 from pathlib import Path
 from struct import Struct, unpack_from
 from sys import byteorder
-from time import perf_counter
 from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
 
-from msgspec.msgpack import Decoder, Encoder
+data_struct = Struct("i") # signed int 32
+index_struct = Struct("II")
 
-base_flags = os.O_CREAT | os.O_RDWR | os.O_BINARY
+pack = data_struct.pack
+unpack = data_struct.unpack
 
+buf = memoryview(bytearray(4))
 
-def lenb(bytes: bytes):
-    return len(bytes).to_bytes(4, byteorder, signed=False)
 
 
 class _BaseChestDB:
@@ -33,7 +32,13 @@ class _BaseChestDB:
 
         # The index is an in-memory dict, mirroring the index file.
         # It maps indexes to their position in the datafile
-        self._index: Dict[str | bytes | int, int] = dict()
+        self._index: Dict[int, int] = dict()
+
+    def __enter__(self):
+        return self
+
+    def __iter__(self):
+        return iter(self._index)
 
 
 class _RO_ChestDatabase(_BaseChestDB, Mapping):
@@ -46,25 +51,23 @@ class _RO_ChestDatabase(_BaseChestDB, Mapping):
                     """
             )
         # initializing a packer and unpacker wich will be used for the index.
-        self._row_struct = Struct("II")
-        self._row_unpack = self._row_struct.iter_unpack
+        self._row_unpack = index_struct.iter_unpack
 
-        self._indexfile = self._indexfile.open("rb", buffering=0)
-        self._datafile = self._datafile.open("rb", buffering=0)
+        self._indexfile: FileIO = self._indexfile.open("rb", buffering=0)
+        self._datafile: FileIO = self._datafile.open("rb", buffering=0)
 
         self.fh_index = mmap(self._indexfile.fileno(), 0, access=ACCESS_READ)
         self.fh_data = mmap(self._datafile.fileno(), 0, access=ACCESS_READ)
 
         self._index = dict(self._row_unpack(self.fh_index.read()))
 
-    def __getitem__(self, key: int | str | bytes) -> bytes:
+    def __getitem__(self, key: int) -> bytes:
 
         pos = self._index[key]  # may raise KeyError
         self.fh_data.seek(pos)
-        siz = unpack_from('I', self.fh_data[:4])[0]
+        siz = unpack_from("I", self.fh_data[:4])[0] # I is used, we assume when it's found in the index, that the length will be positive
 
-        return self.fh_data[pos + 4:pos + siz + 4]
-
+        return self.fh_data[pos + 4 : pos + siz + 4]
 
     def __enter__(self):
         return self
@@ -85,12 +88,7 @@ class _RO_ChestDatabase(_BaseChestDB, Mapping):
 
 
 class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
-    PREFIX_SIZE = 0x04
-    BUFFER_SIZE = 0x200
     MIN_BLOCKSIZE = 0x10
-    FIXMAP = 0x80
-    MAP_16 = 0xDE
-    MAP_32 = 0xDF
 
     def __init__(self, path: Path, mode: Literal["r", "r+"] = "r"):
         super().__init__(path)
@@ -101,16 +99,15 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         self._fragments: List[Tuple[int, int]] = []
 
         # initializing a packer and unpacker wich will be used for the index.
-        self._row_struct = Struct("II")
-        self._row_pack = self._row_struct.pack
-        self._row_unpack = self._row_struct.iter_unpack
-        self._buffer = bytearray()
+        self._row_pack = index_struct.pack
+        self._row_pack_into = index_struct.pack_into
+        self._row_unpack = index_struct.iter_unpack
 
         self._indexfile.touch(exist_ok=True)
         self._datafile.touch(exist_ok=True)
 
-        self.fh_index = self._indexfile.open('rb+', buffering=0)
-        self.fh_data = self._datafile.open('rb+', buffering=0)
+        self.fh_index = self._indexfile.open("rb+", buffering=0)
+        self.fh_data = self._datafile.open("rb+", buffering=0)
         self._buffer = bytearray(self.fh_index.read())
         self._index = dict(self._row_unpack(self._buffer))
 
@@ -118,10 +115,8 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
 
     def _populate_free_blocks(self):
         self.fh_data.seek(0)
-
-        while len((block := self.fh_data.read(4))) == 4:
-
-            size = int.from_bytes(block, byteorder, signed=True)
+        while self.fh_data.readinto(buf) == 4:
+            size = unpack(buf)[0] #has to be signed
 
             if size < 0:
                 size = ~size
@@ -131,30 +126,35 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
             self.fh_data.seek(size, 1)
 
     def commit(self, cleanup=False):
+
         if cleanup:
-            for i,k in enumerate(self._index):
-                self._buffer[i*8:] = self._row_pack(k,self._index[k])
+            # for i, k in enumerate(self._index):
+            #     self._buffer[i * 8 :] = self._row_pack(k, self._index[k])
+
+            # probably no speedup, even slower but test it out
+            buf = memoryview(self._buffer)
+            for i, k in enumerate(self._index):
+                self._row_pack_into(buf, i * 8, k, self._index[k])
 
         self.fh_index.seek(0)
         self.fh_index.write(self._buffer)
         if cleanup:
-            self.fh_index.truncate(len(self._index)*8)
+            self.fh_index.truncate(len(self._index) * 8)
 
     def _addval(self, key, val: bytes):
         self.fh_data.seek(0, 2)
 
         pos = self.fh_data.tell()
-        self.fh_data.write(lenb(val) + val)
-        self._buffer.extend(self._row_pack(key,pos))
+        self.fh_data.write(pack(len(val)) + val)
+        self._buffer.extend(self._row_pack(key, pos))
         self._index[key] = pos
 
     def _setval(self, key, val: bytes, pos: int):
         self.fh_data.seek(pos)
-        self.fh_data.write(lenb(val) + val)
+        self.fh_data.write(pack(len(val)) + val)
 
-        self._buffer.extend(self._row_pack(key,pos))
+        self._buffer.extend(self._row_pack(key, pos))
         self._index[key] = pos
-
 
     def __getitem__(self, key: int | str | bytes) -> bytes:
 
@@ -162,8 +162,7 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
 
         self.fh_data.seek(pos)
         dat = self.fh_data.read(self.BUFFER_SIZE)
-
-        siz = int.from_bytes(dat[: self.PREFIX_SIZE], byteorder, signed=True)
+        siz = unpack(dat[: 4])[0]
 
         if siz > (x := (self.BUFFER_SIZE - self.PREFIX_SIZE)):
             dat += self.fh_data.read(siz - x)
@@ -175,25 +174,16 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         pos = self._index.pop(key)
         self.fh_data.seek(pos)
 
-        siz = int.from_bytes(self.fh_data.read(self.PREFIX_SIZE), byteorder, signed=True)
+        siz = unpack(self.fh_data.read(4))[0]
         self._setfree(pos, siz)
 
-    def __setitem__(self, key: int | str | bytes, value: bytes):
-
-        # if not isinstance(key, int | str | bytes):
-        #     raise KeyInputError
-
-        # if not isinstance(key, int | str | bytes):
-        #     raise DataInputError
+    def __setitem__(self, key: int, value: bytes):
 
         new_size = len(value)
         if key in self._index:
             old_pos = self._index[key]  # pos from index
             self.fh_data.seek(old_pos)  # go to pos
-            old_size = int.from_bytes(
-                self.fh_data.read(self.PREFIX_SIZE), byteorder, signed=False
-            )  # read size from data file
-
+            old_size = unpack(self.fh_data.read(4))[0]
             if new_size > old_size:  # bigger
 
                 # check for room elsewhere or add to the end of file
@@ -221,15 +211,14 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
             else:  # same size
                 self._setval(key, value, old_pos)
         else:
-            if (new_pos := self._claim_free_space(new_size)) != None:
+            if new_pos := self._claim_free_space(new_size):
                 self._setval(key, value, new_pos)
             else:
                 self._addval(key, value)
 
     def _claim_free_space(self, size) -> int:
         for i, block in enumerate(self._free_space):
-            free_pos = block[0]
-            free_size = block[1]
+            free_pos, free_size = block
 
             if size == free_size:
                 del self._free_space[i]
@@ -259,6 +248,7 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
                 break
 
         self.fh_data.seek(pos)
+        # again check struct cast speed compared to tobytes
         self.fh_data.write((~siz).to_bytes(self.PREFIX_SIZE, byteorder, signed=True))
 
         if (
@@ -269,12 +259,6 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
 
         self._free_space.append((pos, siz))
         return None
-
-    def __enter__(self):
-        return self
-
-    def __iter__(self):
-        return iter(self._index)
 
     def close(self, t, v, tr):
         self.commit(cleanup=True)
@@ -287,11 +271,6 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
 
     def __len__(self) -> int:
         return super().__len__()
-
-
-class PersistentDict:
-    def __init__(self):
-        pass
 
 
 def ChestDatabase(path: Path, mode: Literal["r", "r+"] = None):
