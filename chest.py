@@ -2,7 +2,8 @@ from io import FileIO
 from mmap import ACCESS_READ, mmap
 from pathlib import Path
 from struct import Struct, unpack_from
-from sys import byteorder
+# from sortedcontainers import SortedList
+from concurrent.futures import Future
 from typing import Dict, List, Literal, Mapping, MutableMapping, Tuple
 
 data_struct = Struct("i") # signed int 32
@@ -53,8 +54,8 @@ class _RO_ChestDatabase(_BaseChestDB, Mapping):
         # initializing a packer and unpacker wich will be used for the index.
         self._row_unpack = index_struct.iter_unpack
 
-        self._indexfile: FileIO = self._indexfile.open("rb", buffering=0)
-        self._datafile: FileIO = self._datafile.open("rb", buffering=0)
+        self._indexfile: FileIO = self._indexfile.open("rb",)
+        self._datafile: FileIO = self._datafile.open("rb")
 
         self.fh_index = mmap(self._indexfile.fileno(), 0, access=ACCESS_READ)
         self.fh_data = mmap(self._datafile.fileno(), 0, access=ACCESS_READ)
@@ -225,15 +226,23 @@ class _RW_ChestDatabase(_BaseChestDB, MutableMapping):
         for i, block in enumerate(fspce):
             free_pos, free_size = block
 
-            if size == free_size:
-                del fspce[i]
-                return free_pos
-
             if size < free_size:
                 del fspce[i]
                 new_free_pos = free_pos + size + self.PREFIX_SIZE
                 new_free_size = free_size - size - self.PREFIX_SIZE
-                self._setfree(new_free_pos, new_free_size)
+
+                # may not be necesary if line below work
+                # self._setfree(new_free_pos, new_free_size)
+
+                # check if this is correct, speedtest ofcourse
+                self.fh_data.seek(new_free_pos)
+                self.fh_data.write(data_struct.pack(~new_free_size))
+                self._free_space.append((new_free_pos, new_free_size))
+
+                return free_pos
+
+            if size == free_size:
+                del fspce[i]
                 return free_pos
 
     def _setfree(self, pos, siz):

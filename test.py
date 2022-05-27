@@ -14,7 +14,7 @@ d = msgpack.Decoder()
 
 
 def f():
-    with ChestDatabase(p, "r+") as db:
+    with ChestDatabase(p, "r") as db:
 
         for i in range(100_000):
             entry = msgpack.encode(
@@ -37,17 +37,17 @@ def f():
                 }
             )
             start = perf_counter()
-            db[i] = entry
+            # db[i] = entry
             db[i]
             avg_times.append(perf_counter() - start)
         print(f"{1/(sum(avg_times) / len(avg_times)):.1f} ops/sec, {sum(avg_times):4}")
 
-        avg = []
-        for i in range(90_000):
-            start = perf_counter()
-            del db[i]
-            avg.append(perf_counter() - start)
-        print(f"{1/(sum(avg) / len(avg)):.1f} ops/sec, {sum(avg):4}")
+        # avg = []
+        # for i in range(90_000):
+        #     start = perf_counter()
+        #     del db[i]
+        #     avg.append(perf_counter() - start)
+        # print(f"{1/(sum(avg) / len(avg)):.1f} ops/sec, {sum(avg):4}")
 
 
     # for i in range(4000, 70000):
